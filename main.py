@@ -19,6 +19,16 @@ from pathlib import Path
 from typing import Optional
 
 
+# ── Live HUD (optional — gracefully degrades if rich not installed) ──
+try:
+    from HUD import AuraHUD, HUDState
+    _HUD_AVAILABLE = True
+except ImportError:
+    _HUD_AVAILABLE = False
+
+_HUD: "AuraHUD | None" = None   # global singleton, set in AURA.__init__
+
+
 class SystemState:
     speech_start = 0.0
     speech_end   = 0.0
@@ -184,7 +194,14 @@ class SpeechToTextNode:
         self._backoff_secs = di_cfg.get("stt_error_backoff_seconds", 2)
         buf = CONFIG.get("speech_to_text", {}).get("post_speech_buffer", 1.5)
         SystemState.POST_SPEECH_BUFFER = float(buf)
-        logger.info(f"SpeechToTextNode ready. POST_SPEECH_BUFFER={SystemState.POST_SPEECH_BUFFER}s")
+        self._log_timing = bool(cfg.get("log_timing", False))
+        logger.info(
+            f"SpeechToTextNode ready. "
+            f"pause_threshold={self.recognizer.pause_threshold}s  "
+            f"phrase_limit={self.max_phrase_duration}s  "
+            f"POST_SPEECH_BUFFER={SystemState.POST_SPEECH_BUFFER}s  "
+            f"log_timing={self._log_timing}"
+        )
 
     def listen_continuous(self, q: queue.Queue, stop_event: threading.Event) -> None:
         try:
@@ -195,9 +212,16 @@ class SpeechToTextNode:
 
                 while not stop_event.is_set():
                     try:
+                        # ── HUD: show LISTENING while the mic is open ──
+                        # set_listening_if_idle() won't clobber states set by
+                        # the main thread (THINKING, AI_THINKING, SPEAKING…).
+                        if _HUD is not None and not SystemState.is_speaking.is_set():
+                            _HUD.set_listening_if_idle()
+
                         listen_start = time.time()
                         audio = self.recognizer.listen(source, timeout=self.timeout, phrase_time_limit=self.max_phrase_duration)
                         listen_end = time.time()
+                        capture_dur = listen_end - listen_start
 
                         # Drop audio captured while AURA is speaking or during cooldown
                         if SystemState.is_speaking.is_set():
@@ -210,16 +234,58 @@ class SpeechToTextNode:
                             logger.debug("STT: discarded audio overlapping TTS window")
                             continue
 
+                        # ── HUD: show TRANSCRIBING during the Google API call ──
+                        if _HUD is not None:
+                            _HUD.set_transcribing(f"Transcribing {capture_dur:.1f}s of speech…")
+
+                        # ── Google API call (network-bound) ──
+                        api_start = time.time()
                         text = self.recognizer.recognize_google(audio, language=self.language)
+                        api_dur = time.time() - api_start
+
+                        if self._log_timing:
+                            # Audio buffer length in seconds (frames / sample_rate)
+                            try:
+                                audio_sec = len(audio.frame_data) / (audio.sample_rate * audio.sample_width)
+                            except Exception:
+                                audio_sec = 0.0
+                            total = capture_dur + api_dur
+                            logger.info(
+                                f"⏱  STT timing │ "
+                                f"audio={audio_sec:4.1f}s │ "
+                                f"capture+pause={capture_dur:4.1f}s │ "
+                                f"google_api={api_dur:4.1f}s │ "
+                                f"total={total:4.1f}s │ "
+                                f"text='{text[:50]}'"
+                            )
+                            # Heads-up if Google is the bottleneck
+                            if api_dur > 2.5:
+                                logger.warning(
+                                    f"STT: Google API took {api_dur:.1f}s — network latency from "
+                                    f"your location may be high. Consider a local engine (Vosk/Whisper)."
+                                )
+
                         if text and text.strip():
                             text = text.strip()
                             self.input_file.write_text(text, encoding="utf-8")
                             q.put(("voice", text))
                     except self.sr.WaitTimeoutError:
+                        # No speech detected within the timeout — loop back, the
+                        # top-of-loop set_listening_if_idle() will keep the face
+                        # showing.
                         pass
                     except self.sr.UnknownValueError:
-                        pass
+                        # Audio captured but Google couldn't transcribe it.
+                        # Return the HUD to LISTENING so the user knows the mic
+                        # is open again (otherwise it'd sit stuck in TRANSCRIBING).
+                        if _HUD is not None:
+                            _HUD.set_listening()
+                        if self._log_timing:
+                            logger.debug("STT: audio captured but Google couldn't transcribe it")
                     except self.sr.RequestError as exc:
+                        if _HUD is not None:
+                            _HUD.set_error(f"STT API error: {exc}")
+                        logger.warning(f"STT: Google API error — {exc}. Backing off {self._backoff_secs}s")
                         time.sleep(self._backoff_secs)
         except Exception as exc:
             logger.error(f"STT thread crashed: {exc}", exc_info=True)
@@ -330,6 +396,7 @@ class TextToSpeechNode:
         # slip anything in during the gTTS network round-trip.
         SystemState.is_speaking.set()
         SystemState.speech_start = time.time()
+        if _HUD: _HUD.set_speaking(spoken)
 
         try:
             tts = gTTS(text=spoken, lang=self.language, slow=False)
@@ -350,6 +417,7 @@ class TextToSpeechNode:
             def _release_mic():
                 time.sleep(SystemState.POST_SPEECH_BUFFER)
                 SystemState.is_speaking.clear()
+                if _HUD: _HUD.set_idle()
                 # Purge any voice segments buffered while AURA was talking —
                 # they'd be processed as the next user command otherwise.
                 if hasattr(SystemState, "_input_queue") and SystemState._input_queue is not None:
@@ -739,6 +807,12 @@ class AURA:
         self.intent    = IntentClassifier()
         self.stats     = SessionStats()
 
+        # ── HUD ───────────────────────────────────────────────
+        global _HUD
+        if _HUD_AVAILABLE:
+            _HUD = AuraHUD(version=self.version)
+        # ──────────────────────────────────────────────────────
+
     def _route(self, text: str, intent: str) -> str:
         if intent == "web_search":
             text_lower = text.lower()
@@ -769,9 +843,28 @@ class AURA:
 
     def run(self) -> None:
         print(self._BANNER.format(version=self.version))
+
+        # ── Start HUD (takes over the terminal display) ───────
+        if _HUD:
+            _HUD.start()
+            _HUD.log("AURA online — HUD active")
+            _HUD.add_message("system", self.startup_greeting)
+
         self.tts.speak(self.startup_greeting)
 
         while True:
+            # ── Refresh status strip each iteration ───────────
+            if _HUD:
+                _HUD.update_status(
+                    voice_alive = self.dual.voice_alive,
+                    kb_alive    = self.dual.keyboard_alive,
+                    turns       = self.assistant.memory.turn_count,
+                    total       = self.stats.total_inputs,
+                    voice       = self.stats.voice_inputs,
+                    keyboard    = self.stats.keyboard_inputs,
+                    errors      = self.stats.errors,
+                )
+
             print("\n" + "─" * 70)
             print(self._status_line())
 
@@ -782,17 +875,58 @@ class AURA:
                 src_icon = "🎤" if source == "voice" else "⌨️ "
                 print(f"\n  {src_icon} [{source.upper()}]  You: {user_text}")
 
+                # ── HUD: show what was received ───────────────
+                # NOTE: The STT thread already drove the LISTENING state during
+                # the actual listening + transcribing phases. By the time we
+                # get here, the audio is already captured and Google has
+                # responded, so we go straight to PROCESSING.
+                if _HUD:
+                    if source == "keyboard":
+                        _HUD.set_typing()
+                        time.sleep(0.05)
+                    _HUD.set_thinking("Heard: " + user_text[:50])
+                    _HUD.add_message("user", user_text, source)
+                # ─────────────────────────────────────────────
+
                 buffered = self.input_file.read_text(encoding="utf-8").strip() if self.input_file.exists() else user_text
                 intent, confidence = self.intent.classify(buffered)
                 icon = self._INTENT_ICONS.get(intent, "🔹")
                 print(f"  {icon}  Intent: {intent}  [confidence: {confidence:.0%}]")
+
+                # ── HUD: intent classified ────────────────────
+                if _HUD:
+                    _HUD.set_intent(intent, confidence)
+                    _HUD.set_thinking(f"Routing → {intent.replace('_', ' ')}")
+                # ─────────────────────────────────────────────
+
                 self.stats.record_input(source, intent)
 
                 if intent == "exit":
                     print(f"\n  {self.shutdown_message}\n\n  Session Summary:\n  {self.stats.summary()}")
+                    if _HUD: _HUD.stop()
                     self.tts.speak(self.shutdown_message)
                     self.dual.stop()
                     break
+
+                # ── HUD: pre-routing state ────────────────────
+                if _HUD:
+                    if intent == "web_search":
+                        _HUD.set_web_searching(buffered)
+                    elif intent == "content_generation":
+                        from GeneratorNode import _detect_mode  # best-effort
+                        mode = ""
+                        try:
+                            mode = self.generator._detect_mode(
+                                buffered,
+                                self.generator._extract_image_path(buffered)
+                            )
+                        except Exception:
+                            pass
+                        _HUD.set_generating(mode)
+                    else:
+                        model = getattr(self.assistant, "chat_model", "")
+                        _HUD.set_ai_thinking(model)
+                # ─────────────────────────────────────────────
 
                 response = self._route(buffered, intent)
 
@@ -801,11 +935,18 @@ class AURA:
                     if on_disk: response = on_disk
 
                 print(f"\n  {self.name}:\n{response}\n")
-                self.tts.speak(response)
+
+                # ── HUD: log AURA's reply ─────────────────────
+                if _HUD:
+                    _HUD.add_message("aura", response)
+                # ─────────────────────────────────────────────
+
+                self.tts.speak(response)   # set_speaking() is called inside speak()
 
             except KeyboardInterrupt:
                 print("\n\n  [Interrupted by user]")
                 print(f"\n   Session Summary:\n  {self.stats.summary()}")
+                if _HUD: _HUD.stop()
                 self.tts.speak(self.shutdown_message)
                 self.dual.stop()
                 break
@@ -813,6 +954,7 @@ class AURA:
                 self.stats.record_error()
                 err_msg = "I encountered an unexpected error. Please try again."
                 print(f"\n  Error: {exc}")
+                if _HUD: _HUD.set_error(str(exc))
                 self.tts.speak(err_msg)
 
 

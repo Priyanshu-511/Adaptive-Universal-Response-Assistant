@@ -1,17 +1,18 @@
 {
   "speech_to_text": {
-    "energy_threshold": 150,
+    "energy_threshold": 200,
     "dynamic_energy_threshold": true,
     "dynamic_energy_adjustment_damping": 0.15,
     "dynamic_energy_ratio": 1.5,
-    "pause_threshold": 0.8,
+    "pause_threshold": 2.5,
     "phrase_threshold": 0.3,
-    "non_speaking_duration": 0.5,
+    "non_speaking_duration": 0.8,
     "wait_for_speech_timeout": 20,
-    "max_phrase_duration": 60,
+    "max_phrase_duration": 45,
     "language": "en-IN",
-    "calibration_duration": 1.0,
-    "post_speech_buffer": 0.5
+    "calibration_duration": 1.5,
+    "post_speech_buffer": 0.5,
+    "log_timing": true
   },
   "text_to_speech": {
     "rate": 130,
